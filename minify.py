@@ -17,16 +17,18 @@ ENABLE_RENAMING = True
 
 # C Keywords that should never be renamed
 KEYWORDS = {
+    # C89/C90 keywords
     'auto', 'break', 'case', 'char', 'const', 'continue', 'default', 'do',
     'double', 'else', 'enum', 'extern', 'float', 'for', 'goto', 'if',
     'int', 'long', 'register', 'return', 'short', 'signed', 'sizeof', 'static',
     'struct', 'switch', 'typedef', 'union', 'unsigned', 'void', 'volatile', 'while',
-    # Common stdlib functions
-    'main', 'printf', 'fprintf', 'sprintf', 'scanf', 'sscanf', 'fscanf',
-    'malloc', 'calloc', 'realloc', 'free', 'memcpy', 'memset', 'strlen',
-    'strcpy', 'strncpy', 'strcmp', 'strncmp', 'strcat', 'strncat',
-    'fopen', 'fclose', 'fread', 'fwrite', 'fseek', 'ftell', 'rewind',
-    'exit', 'abort', 'atexit', 'getenv', 'system',
+    # C99 keywords
+    'inline', 'restrict', '_Bool', '_Complex', '_Imaginary',
+    # C11 keywords
+    '_Alignas', '_Alignof', '_Atomic', '_Static_assert', '_Noreturn',
+    '_Thread_local', '_Generic',
+    # Common reserved identifiers
+    'main',
 }
 
 
@@ -51,13 +53,16 @@ class Scope:
         self.counter = 0
         self.is_protected = is_protected  # Don't rename in struct/union/enum
         
-    def add_variable(self, name):
+    def add_variable(self, name, reserved_names=None):
         """Add a variable to this scope and generate a short name"""
-        if name in self.mappings or name in KEYWORDS:
+        if reserved_names is None:
+            reserved_names = KEYWORDS
+        
+        if name in self.mappings or name in reserved_names:
             return self.mappings.get(name, name)
         
         new_name = generate_short_name(self.counter)
-        while new_name in KEYWORDS:
+        while new_name in reserved_names:
             self.counter += 1
             new_name = generate_short_name(self.counter)
         
@@ -80,6 +85,9 @@ class CMinifier:
         self.parser = Parser(self.language)
         self.tree = self.parser.parse(self.source_bytes)
         
+        # Function name collection
+        self.function_names = set()
+        
         # Scope management
         self.scopes = [Scope()]  # Global scope
         self.current_scope_idx = 0
@@ -91,6 +99,66 @@ class CMinifier:
     def get_node_text(self, node):
         """Get the text content of a node"""
         return self.source_bytes[node.start_byte:node.end_byte].decode('utf-8')
+    
+    def get_function_name_from_declarator(self, declarator):
+        """Extract function name from a declarator node"""
+        # Handle different declarator types
+        if declarator.type == 'identifier':
+            return self.get_node_text(declarator)
+        elif declarator.type == 'function_declarator':
+            # Recursively get the declarator inside
+            inner = declarator.child_by_field_name('declarator')
+            if inner:
+                return self.get_function_name_from_declarator(inner)
+        elif declarator.type == 'pointer_declarator':
+            # Function pointer: int (*func)(...)
+            inner = declarator.child_by_field_name('declarator')
+            if inner:
+                return self.get_function_name_from_declarator(inner)
+        elif declarator.type == 'parenthesized_declarator':
+            # Parenthesized: (func)
+            for child in declarator.children:
+                if child.type == 'identifier':
+                    return self.get_node_text(child)
+                elif child.type in ('function_declarator', 'pointer_declarator'):
+                    return self.get_function_name_from_declarator(child)
+        return None
+    
+    def collect_function_names(self, node):
+        """Recursively collect all function names from the AST"""
+        if node.type == 'function_definition':
+            # Get function name from declarator
+            declarator = node.child_by_field_name('declarator')
+            if declarator:
+                func_name = self.get_function_name_from_declarator(declarator)
+                if func_name:
+                    self.function_names.add(func_name)
+        
+        elif node.type == 'declaration':
+            # Function declaration (prototype): int foo();
+            # Check if this is a function declaration by looking for function_declarator
+            for child in node.children:
+                if child.type == 'function_declarator' or self.has_function_declarator(child):
+                    declarator = child
+                    if declarator.type == 'init_declarator':
+                        declarator = declarator.child_by_field_name('declarator')
+                    if declarator:
+                        func_name = self.get_function_name_from_declarator(declarator)
+                        if func_name:
+                            self.function_names.add(func_name)
+        
+        # Recursively process children
+        for child in node.children:
+            self.collect_function_names(child)
+    
+    def has_function_declarator(self, node):
+        """Check if a node contains a function_declarator"""
+        if node.type == 'function_declarator':
+            return True
+        for child in node.children:
+            if self.has_function_declarator(child):
+                return True
+        return False
     
     def is_comment(self, node):
         """Check if node is a comment"""
@@ -210,14 +278,16 @@ class CMinifier:
             if is_decl:
                 # Static global variable
                 if self.is_static_global(node):
-                    new_name = self.scopes[0].add_variable(name)
+                    reserved = KEYWORDS | self.function_names
+                    new_name = self.scopes[0].add_variable(name, reserved)
                     self.replacements[node.start_byte] = (node.end_byte, new_name)
                 
                 # Local variable or parameter
                 elif in_function and self.current_scope_idx > 0:
                     scope = self.scopes[self.current_scope_idx]
                     if not scope.is_protected:
-                        new_name = scope.add_variable(name)
+                        reserved = KEYWORDS | self.function_names
+                        new_name = scope.add_variable(name, reserved)
                         self.replacements[node.start_byte] = (node.end_byte, new_name)
             else:
                 # Usage - look up in scopes from current to global
@@ -378,6 +448,9 @@ class CMinifier:
     
     def minify(self):
         """Main minification process"""
+        # Step 0: Collect all function names to avoid naming conflicts
+        self.collect_function_names(self.tree.root_node)
+        
         # Step 1: Remove comments
         self.find_comments(self.tree.root_node)
         
